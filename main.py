@@ -13,6 +13,8 @@ SUPABASE_URL = "https://uhsarpdtdbahjkcsmeqw.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVoc2FycGR0ZGJhaGprY3NtZXF3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3OTY3MzYsImV4cCI6MjA5MzM3MjczNn0.U_zHfzd4P5wLYiv8Cmu-p6_B7JpEbBjMhBl7MVci8Ng"
 BUCKET_NAME = "accident-images"
 
+CONFIDENCE_THRESHOLD = 0.5  # ✅ Confidence threshold
+
 # =========================
 # LOAD MODELS
 # =========================
@@ -26,9 +28,7 @@ print("Models loaded")
 # SUPABASE UPLOAD
 # =========================
 def upload_to_supabase(image_path, plate_text="unknown"):
-    """Upload image to Supabase Storage and return public URL."""
     timestamp = int(time.time())
-    # Clean plate text for use in filename
     clean_plate = plate_text.strip().replace(" ", "_").replace("\n", "") or "unknown"
     filename = f"{timestamp}_{clean_plate}.jpg"
 
@@ -82,18 +82,31 @@ def run_pipeline(path):
 
     # 1) Accident
     accident = accident_model(img, verbose=False)
-    if accident[0].boxes is None:
+    if accident[0].boxes is None or len(accident[0].boxes) == 0:
         print("No accident ❌")
+        return
+
+    # ✅ Check accident confidence >= 0.5
+    accident_conf = accident[0].boxes.conf[0].item()
+    print(f"Accident confidence: {accident_conf:.2f}")
+    if accident_conf < CONFIDENCE_THRESHOLD:
+        print("Accident confidence too low ❌")
         return
 
     print("Accident detected ✅")
 
     # 2) Plate
     plate = plate_model(img, verbose=False)
-
-    if plate[0].boxes is None:
+    if plate[0].boxes is None or len(plate[0].boxes) == 0:
         print("No plate ❌")
-        # Upload image even without plate
+        upload_to_supabase(path)
+        return
+
+    # ✅ Check plate confidence >= 0.5
+    plate_conf = plate[0].boxes.conf[0].item()
+    print(f"Plate confidence: {plate_conf:.2f}")
+    if plate_conf < CONFIDENCE_THRESHOLD:
+        print("Plate confidence too low ❌")
         upload_to_supabase(path)
         return
 
