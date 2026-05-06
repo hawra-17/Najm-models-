@@ -1,8 +1,17 @@
 import cv2
 import time
+import requests
+import os
 from ultralytics import YOLO
 from picamera2 import Picamera2
 import pytesseract
+
+# =========================
+# SUPABASE CONFIG
+# =========================
+SUPABASE_URL = "https://uhsarpdtdbahjkcsmeqw.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVoc2FycGR0ZGJhaGprY3NtZXF3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc3OTY3MzYsImV4cCI6MjA5MzM3MjczNn0.U_zHfzd4P5wLYiv8Cmu-p6_B7JpEbBjMhBl7MVci8Ng"
+BUCKET_NAME = "accident-images"
 
 # =========================
 # LOAD MODELS
@@ -12,6 +21,34 @@ plate_model = YOLO("plate_best.pt")
 region_model = YOLO("region_best.pt")
 
 print("Models loaded")
+
+# =========================
+# SUPABASE UPLOAD
+# =========================
+def upload_to_supabase(image_path, plate_text="unknown"):
+    """Upload image to Supabase Storage and return public URL."""
+    timestamp = int(time.time())
+    # Clean plate text for use in filename
+    clean_plate = plate_text.strip().replace(" ", "_").replace("\n", "") or "unknown"
+    filename = f"{timestamp}_{clean_plate}.jpg"
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_NAME}/{filename}"
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "image/jpeg",
+    }
+
+    with open(image_path, "rb") as f:
+        response = requests.post(upload_url, headers=headers, data=f)
+
+    if response.status_code in (200, 201):
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{filename}"
+        print(f"✅ Image uploaded to Supabase: {public_url}")
+        return public_url
+    else:
+        print(f"❌ Upload failed: {response.status_code} - {response.text}")
+        return None
 
 # =========================
 # CAMERA
@@ -41,8 +78,6 @@ def run_ocr(img):
 # =========================
 def run_pipeline(path):
     img = cv2.imread(path)
-
-    # تصغير الصورة (مهم)
     img = cv2.resize(img, (640, 384))
 
     # 1) Accident
@@ -58,17 +93,20 @@ def run_pipeline(path):
 
     if plate[0].boxes is None:
         print("No plate ❌")
+        # Upload image even without plate
+        upload_to_supabase(path)
         return
 
     box = plate[0].boxes.xyxy[0].cpu().numpy()
     x1, y1, x2, y2 = map(int, box)
-
     plate_crop = img[y1:y2, x1:x2]
 
     # 3) OCR
     text = run_ocr(plate_crop)
-
     print("Plate:", text)
+
+    # 4) Upload to Supabase
+    upload_to_supabase(path, plate_text=text)
 
 # =========================
 # MAIN
