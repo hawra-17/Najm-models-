@@ -53,12 +53,11 @@ def upload_to_supabase(image_path, plate_text="unknown"):
 # =========================
 # CAMERA
 # =========================
-def capture_image():
+def capture_image(filename):
     picam2 = Picamera2()
     picam2.start()
     time.sleep(2)
 
-    filename = "capture.jpg"
     picam2.capture_file(filename)
 
     picam2.stop()
@@ -76,33 +75,53 @@ def run_ocr(img):
 # =========================
 # PIPELINE
 # =========================
-def run_pipeline(path):
+def detect_accident(path):
     img = cv2.imread(path)
     img = cv2.resize(img, (640, 384))
 
-    # 1) Accident
     accident = accident_model(img, verbose=False)
     if accident[0].boxes is None or len(accident[0].boxes) == 0:
         print("No accident ❌")
-        return
+        return False
 
-    # ✅ Check accident confidence >= 0.5
     accident_conf = accident[0].boxes.conf[0].item()
     print(f"Accident confidence: {accident_conf:.2f}")
     if accident_conf < CONFIDENCE_THRESHOLD:
         print("Accident confidence too low ❌")
-        return
+        return False
 
     print("Accident detected ✅")
+    return True
 
-    # 2) Plate
-    plate = plate_model(img, verbose=False)
+
+def detect_plate(path):
+    img = cv2.imread(path)
+    img = cv2.resize(img, (640, 384))
+
+    # 1) Region detection
+    region = region_model(img, verbose=False)
+    if region[0].boxes is None or len(region[0].boxes) == 0:
+        print("No region ❌")
+        upload_to_supabase(path)
+        return
+
+    region_conf = region[0].boxes.conf[0].item()
+    print(f"Region confidence: {region_conf:.2f}")
+    if region_conf < CONFIDENCE_THRESHOLD:
+        print("Region confidence too low ❌")
+        upload_to_supabase(path)
+        return
+
+    rx1, ry1, rx2, ry2 = map(int, region[0].boxes.xyxy[0].cpu().numpy())
+    region_crop = img[ry1:ry2, rx1:rx2]
+
+    # 2) Plate detection inside region
+    plate = plate_model(region_crop, verbose=False)
     if plate[0].boxes is None or len(plate[0].boxes) == 0:
         print("No plate ❌")
         upload_to_supabase(path)
         return
 
-    # ✅ Check plate confidence >= 0.5
     plate_conf = plate[0].boxes.conf[0].item()
     print(f"Plate confidence: {plate_conf:.2f}")
     if plate_conf < CONFIDENCE_THRESHOLD:
@@ -110,19 +129,21 @@ def run_pipeline(path):
         upload_to_supabase(path)
         return
 
-    box = plate[0].boxes.xyxy[0].cpu().numpy()
-    x1, y1, x2, y2 = map(int, box)
-    plate_crop = img[y1:y2, x1:x2]
+    x1, y1, x2, y2 = map(int, plate[0].boxes.xyxy[0].cpu().numpy())
+    plate_crop = region_crop[y1:y2, x1:x2]
 
     # 3) OCR
     text = run_ocr(plate_crop)
     print("Plate:", text)
 
-    # 4) Upload to Supabase
+    # 4) Upload
     upload_to_supabase(path, plate_text=text)
 
 # =========================
 # MAIN
 # =========================
-img = capture_image()
-run_pipeline(img)
+accident_img = capture_image("accident.jpg")
+detect_accident(accident_img)
+
+plate_img = capture_image("plate.jpg")
+detect_plate(plate_img)
