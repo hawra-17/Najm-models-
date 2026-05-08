@@ -4,6 +4,7 @@ import requests
 import os
 from ultralytics import YOLO
 from picamera2 import Picamera2
+from libcamera import controls
 import pytesseract
 
 # =========================
@@ -55,8 +56,27 @@ def upload_to_supabase(image_path, plate_text="unknown"):
 # =========================
 def capture_image():
     picam2 = Picamera2()
+
+    # Full-res still config for IMX219 (Camera Module v2)
+    config = picam2.create_still_configuration(
+        main={"size": (3280, 2464), "format": "RGB888"}
+    )
+    picam2.configure(config)
+
+    # v2 has no autofocus — tune exposure/gain/AWB to reduce blur and noise
+    picam2.set_controls({
+        "AeEnable": True,
+        "AwbEnable": True,
+        "AwbMode": controls.AwbModeEnum.Daylight,
+        "AeExposureMode": controls.AeExposureModeEnum.Short,  # favor short exposure to freeze motion
+        "AnalogueGain": 1.0,
+        "Sharpness": 1.5,
+        "Contrast": 1.1,
+        "Saturation": 1.0,
+    })
+
     picam2.start()
-    time.sleep(2)
+    time.sleep(3)  # let AE/AWB settle
 
     filename = "capture.jpg"
     picam2.capture_file(filename)
