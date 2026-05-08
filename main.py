@@ -103,14 +103,16 @@ def run_pipeline(path):
     # 1) Accident
     accident = accident_model(img, verbose=False)
     if accident[0].boxes is None or len(accident[0].boxes) == 0:
-        print("No accident ❌")
+        print("No accident ❌ — uploading anyway")
+        upload_to_supabase(path)
         return
 
     # ✅ Check accident confidence >= 0.5
     accident_conf = accident[0].boxes.conf[0].item()
     print(f"Accident confidence: {accident_conf:.2f}")
     if accident_conf < CONFIDENCE_THRESHOLD:
-        print("Accident confidence too low ❌")
+        print("Accident confidence too low ❌ — uploading anyway")
+        upload_to_supabase(path)
         return
 
     print("Accident detected ✅")
