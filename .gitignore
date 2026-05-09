@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+capture.jpg
+result.jpg
+plate_*.jpg
+plate_debug.jpg
+plate_crop.jpg
