@@ -203,34 +203,58 @@ def upload_to_supabase(image_path, plate_text="unknown"):
         return None
 
 # =========================
-# CAMERA
+# CAMERA — IMX219 (Pi Camera v2) tuned for small-detail capture
 # =========================
 def capture_image():
     picam2 = Picamera2()
 
+    # Full 8MP resolution, BGR memory order (matches OpenCV).
+    # buffer_count=2 reduces frame drops during AE settling.
     config = picam2.create_still_configuration(
         main={"size": (3280, 2464), "format": "RGB888"},
+        buffer_count=2,
         controls={
+            # --- Auto exposure / white balance ---
             "AeEnable": True,
             "AwbEnable": True,
-            "AwbMode": controls.AwbModeEnum.Daylight,
-            "AeExposureMode": controls.AeExposureModeEnum.Short,
-            "AnalogueGain": 1.0,       # Low noise
-            "Sharpness": 8.0,          # ✅ Increased from 1.5 → much sharper
-            "Contrast": 1.2,
+            "AwbMode": controls.AwbModeEnum.Auto,
+            "AeExposureMode": controls.AeExposureModeEnum.Short,  # freeze motion
+            "AeMeteringMode": controls.AeMeteringModeEnum.CentreWeighted,
+
+            # --- Sensor gain (keep at 1.0 — IMX219 gets noisy above ~2.0) ---
+            "AnalogueGain": 1.0,
+
+            # --- Image processing ---
+            # Sharpness 1.0 = neutral. Higher values create ringing artifacts
+            # around edges that destroy plate-character detail.
+            "Sharpness": 1.0,
+            "Contrast": 1.0,
             "Saturation": 1.0,
-            "NoiseReductionMode": 2,   # ✅ High quality noise reduction
+            "Brightness": 0.0,
+
+            # HighQuality keeps edge detail; Fast smears small features.
+            "NoiseReductionMode": controls.draft.NoiseReductionModeEnum.HighQuality,
         }
     )
     picam2.configure(config)
+
+    # Save at JPEG quality 95 (default ~85 loses fine detail like plate chars).
+    picam2.options["quality"] = 95
+
     picam2.start()
-    time.sleep(3)
+    time.sleep(4)  # give AE/AWB time to fully converge
 
     filename = "capture.jpg"
-    picam2.capture_file(filename)
+
+    # Capture as numpy array then write with OpenCV at quality 95.
+    # This avoids any intermediate re-encoding and gives full control.
+    frame = picam2.capture_array("main")
+    cv2.imwrite(filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
     picam2.stop()
     picam2.close()
 
+    print(f"✅ Captured {frame.shape[1]}x{frame.shape[0]} → {filename}")
     return filename
 
 # =========================
