@@ -554,154 +554,94 @@ def draw_box(img, box, label):
 # =========================
 def run_pipeline(path):
 
-    # Read ORIGINAL FULL-RES image
+    upload_path = path
+    best_plate_text = "unknown"
+
     img = cv2.imread(path)
 
     if img is None:
-        print("❌ Failed to load image")
-        return
-
-    print("✅ Running accident detection")
-
-    # =========================
-    # ACCIDENT DETECTION
-    # =========================
-    accident_results = accident_model(
-        img,
-        verbose=False
-    )
-
-    if (
-        accident_results[0].boxes is None
-        or len(accident_results[0].boxes) == 0
-    ):
-
-        print("❌ No accident detected")
-
+        print("❌ Failed to load image — uploading raw capture anyway")
         upload_to_supabase(path)
-
         return
 
-    accident_conf = (
-        accident_results[0]
-        .boxes
-        .conf[0]
-        .item()
-    )
+    try:
+        print("✅ Running accident detection")
 
-    print(f"Accident confidence: {accident_conf:.2f}")
+        # =========================
+        # ACCIDENT DETECTION
+        # =========================
+        accident_results = accident_model(img, verbose=False)
 
-    if accident_conf < CONFIDENCE_THRESHOLD:
+        accident_detected = False
+        if (
+            accident_results[0].boxes is not None
+            and len(accident_results[0].boxes) > 0
+        ):
+            accident_conf = accident_results[0].boxes.conf[0].item()
+            print(f"Accident confidence: {accident_conf:.2f}")
 
-        print("❌ Confidence too low")
+            if accident_conf >= CONFIDENCE_THRESHOLD:
+                print("✅ Accident detected")
+                accident_detected = True
 
-        upload_to_supabase(path)
+                accident_box = (
+                    accident_results[0].boxes.xyxy[0].cpu().numpy()
+                )
+                draw_box(
+                    img,
+                    accident_box,
+                    f"Accident {accident_conf:.2f}"
+                )
+            else:
+                print("❌ Accident confidence too low")
+        else:
+            print("❌ No accident detected")
 
-        return
+        # =========================
+        # PLATE DETECTION (runs regardless of accident result)
+        # =========================
+        print("✅ Running plate detection")
+        plate_results = plate_model(img, verbose=False)
 
-    print("✅ Accident detected")
+        if (
+            plate_results[0].boxes is not None
+            and len(plate_results[0].boxes) > 0
+        ):
+            for i, box in enumerate(plate_results[0].boxes.xyxy):
+                confidence = plate_results[0].boxes.conf[i].item()
+                if confidence < CONFIDENCE_THRESHOLD:
+                    continue
 
-    # Draw accident box
-    accident_box = (
-        accident_results[0]
-        .boxes
-        .xyxy[0]
-        .cpu()
-        .numpy()
-    )
+                x1, y1, x2, y2 = map(int, box.cpu().numpy())
+                plate_crop = img[y1:y2, x1:x2]
+                if plate_crop.size == 0:
+                    continue
 
-    draw_box(
-        img,
-        accident_box,
-        f"Accident {accident_conf:.2f}"
-    )
+                plate_text = run_ocr(plate_crop)
+                print(f"✅ Plate Detected: {plate_text}")
+                best_plate_text = plate_text
 
-    # =========================
-    # PLATE DETECTION
-    # =========================
-    print("✅ Running plate detection")
+                draw_box(img, [x1, y1, x2, y2], plate_text)
+                cv2.imwrite(f"plate_{i}.jpg", plate_crop)
+        else:
+            print("❌ No plate detected")
 
-    plate_results = plate_model(
-        img,
-        verbose=False
-    )
+        # If we drew anything on the image, upload the annotated version.
+        # Otherwise upload the raw capture.
+        if accident_detected or best_plate_text != "unknown":
+            result_path = "result.jpg"
+            cv2.imwrite(result_path, img)
+            print("✅ Result image saved")
+            upload_path = result_path
 
-    if (
-        plate_results[0].boxes is None
-        or len(plate_results[0].boxes) == 0
-    ):
-
-        print("❌ No plate detected")
-
-        cv2.imwrite("result.jpg", img)
-
-        upload_to_supabase("result.jpg")
-
-        return
-
-    best_plate_text = "unknown"
-
-    for i, box in enumerate(
-        plate_results[0].boxes.xyxy
-    ):
-
-        confidence = (
-            plate_results[0]
-            .boxes
-            .conf[i]
-            .item()
-        )
-
-        if confidence < CONFIDENCE_THRESHOLD:
-            continue
-
-        x1, y1, x2, y2 = map(
-            int,
-            box.cpu().numpy()
-        )
-
-        # Crop plate
-        plate_crop = img[y1:y2, x1:x2]
-
-        if plate_crop.size == 0:
-            continue
-
-        # OCR
-        plate_text = run_ocr(plate_crop)
-
-        print(f"✅ Plate Detected: {plate_text}")
-
-        best_plate_text = plate_text
-
-        # Draw plate box
-        draw_box(
-            img,
-            [x1, y1, x2, y2],
-            plate_text
-        )
-
-        # Save cropped plate
-        cv2.imwrite(
-            f"plate_{i}.jpg",
-            plate_crop
-        )
+    except Exception as e:
+        print(f"⚠️ Pipeline error: {e} — uploading raw capture")
+        upload_path = path
 
     # =========================
-    # SAVE RESULT IMAGE
+    # ALWAYS UPLOAD
     # =========================
-    result_path = "result.jpg"
-
-    cv2.imwrite(result_path, img)
-
-    print("✅ Result image saved")
-
-    # =========================
-    # UPLOAD
-    # =========================
-    upload_to_supabase(
-        result_path,
-        best_plate_text
-    )
+    upload_to_supabase(upload_path, best_plate_text)
 
 # =========================
 # START
