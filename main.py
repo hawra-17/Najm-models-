@@ -158,16 +158,13 @@ from ultralytics import YOLO
 from picamera2 import Picamera2
 from libcamera import controls
 import pytesseract
-from dotenv import load_dotenv
 
 # =========================
-# SUPABASE CONFIG (loaded from .env)
+# SUPABASE CONFIG
 # =========================
-load_dotenv()
-
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-BUCKET_NAME = os.environ["BUCKET_NAME"]
+SUPABASE_URL = "https://mncsiqxctyqdrfqtnzha.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1uY3NpcXhjdHlxZHJmcXRuemhhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0NDk3NjIsImV4cCI6MjA4NjAyNTc2Mn0.bP-0G6IAjAr-731aOEJSPkNNA_pwomOvSwUmipxKjP8"
+BUCKET_NAME = "accident-images"
 
 CONFIDENCE_THRESHOLD = 0.5
 
