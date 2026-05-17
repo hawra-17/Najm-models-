@@ -153,10 +153,9 @@ import cv2
 import time
 import requests
 import os
+import subprocess
 import numpy as np
 from ultralytics import YOLO
-from picamera2 import Picamera2
-from libcamera import controls
 import pytesseract
 
 # =========================
@@ -167,6 +166,15 @@ SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJ
 BUCKET_NAME = "accident-images"
 
 CONFIDENCE_THRESHOLD = 0.5
+
+# Stop recording if no plate is found within this many seconds (safeguard)
+MAX_RECORD_SECONDS = 60
+
+# Video capture settings (from the rpicam-vid command)
+VIDEO_WIDTH = 1920
+VIDEO_HEIGHT = 1080
+VIDEO_FRAMERATE = 30
+DETECT_FPS = 5  # how many frames/sec to pull out for YOLO detection
 
 # =========================
 # LOAD MODELS
@@ -180,82 +188,137 @@ print("Models loaded")
 # =========================
 # SUPABASE UPLOAD
 # =========================
-def upload_to_supabase(image_path, plate_text="unknown"):
-    timestamp = int(time.time())
-    clean_plate = plate_text.strip().replace(" ", "_").replace("\n", "") or "unknown"
-    filename = f"{timestamp}_{clean_plate}.jpg"
-
-    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_NAME}/{filename}"
+def upload_file(local_path, dest_name, content_type):
+    """Upload any file (image or video) to the Supabase bucket."""
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_NAME}/{dest_name}"
     headers = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "image/jpeg",
+        "Content-Type": content_type,
     }
 
-    with open(image_path, "rb") as f:
+    with open(local_path, "rb") as f:
         response = requests.post(upload_url, headers=headers, data=f)
 
     if response.status_code in (200, 201):
-        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{filename}"
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{dest_name}"
         print(f"✅ Uploaded: {public_url}")
         return public_url
     else:
-        print(f"❌ Upload failed: {response.status_code} - {response.text}")
+        print(f"❌ Upload failed ({dest_name}): {response.status_code} - {response.text}")
         return None
 
+
+def upload_event(video_path, accident_path, plate_path, plate_text="unknown"):
+    """Upload the video + accident frame + plate crop for one detected event."""
+    timestamp = int(time.time())
+    clean_plate = plate_text.strip().replace(" ", "_").replace("\n", "") or "unknown"
+    base = f"{timestamp}_{clean_plate}"
+
+    results = {}
+    if video_path and os.path.exists(video_path):
+        results["video"] = upload_file(video_path, f"{base}.mp4", "video/mp4")
+    if accident_path and os.path.exists(accident_path):
+        results["accident"] = upload_file(accident_path, f"{base}_accident.jpg", "image/jpeg")
+    if plate_path and os.path.exists(plate_path):
+        results["plate"] = upload_file(plate_path, f"{base}_plate.jpg", "image/jpeg")
+    return results
+
 # =========================
-# CAMERA — IMX219 (Pi Camera v2) tuned for small-detail capture
+# RECORDER — rpicam-vid records to video.mp4 while ffmpeg also
+# pipes live MJPEG frames to us for YOLO detection.
 # =========================
-def capture_image():
-    picam2 = Picamera2()
+class VideoRecorder:
+    """
+    Pipeline:
+        rpicam-vid (H264 to stdout)
+            -> ffmpeg
+                 -> video.mp4              (fragmented, safe to kill anytime)
+                 -> MJPEG frames to stdout (decoded here for detection)
 
-    # Full 8MP resolution, BGR memory order (matches OpenCV).
-    # buffer_count=2 reduces frame drops during AE settling.
-    config = picam2.create_still_configuration(
-        main={"size": (3280, 2464), "format": "RGB888"},
-        buffer_count=2,
-        controls={
-            # --- Auto exposure / white balance ---
-            "AeEnable": True,
-            "AwbEnable": True,
-            "AwbMode": controls.AwbModeEnum.Auto,
-            "AeExposureMode": controls.AeExposureModeEnum.Short,  # freeze motion
-            "AeMeteringMode": controls.AeMeteringModeEnum.CentreWeighted,
+    The video keeps recording while we grab frames — nothing stops the
+    recording until we explicitly call .stop().
+    """
 
-            # --- Sensor gain (keep at 1.0 — IMX219 gets noisy above ~2.0) ---
-            "AnalogueGain": 1.0,
+    def __init__(self, video_path="video.mp4"):
+        self.video_path = video_path
+        self.rpicam = None
+        self.ffmpeg = None
+        self._buf = b""
 
-            # --- Image processing ---
-            # Sharpness 1.0 = neutral. Higher values create ringing artifacts
-            # around edges that destroy plate-character detail.
-            "Sharpness": 1.0,
-            "Contrast": 1.0,
-            "Saturation": 1.0,
-            "Brightness": 0.0,
+    def start(self):
+        if os.path.exists(self.video_path):
+            os.remove(self.video_path)
 
-            # HighQuality keeps edge detail; Fast smears small features.
-            "NoiseReductionMode": controls.draft.NoiseReductionModeEnum.HighQuality,
-        }
-    )
-    picam2.configure(config)
+        # rpicam-vid: continuous (-t 0), H264 to stdout. --inline keeps
+        # SPS/PPS headers in-stream so ffmpeg can start decoding immediately.
+        self.rpicam = subprocess.Popen(
+            [
+                "rpicam-vid",
+                "-t", "0",
+                "--width", str(VIDEO_WIDTH),
+                "--height", str(VIDEO_HEIGHT),
+                "--framerate", str(VIDEO_FRAMERATE),
+                "--codec", "h264",
+                "--inline",
+                "--nopreview",
+                "-o", "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
 
-    # Save at JPEG quality 95 (default ~85 loses fine detail like plate chars).
-    picam2.options["quality"] = 95
+        # ffmpeg: one input, two outputs.
+        #  1) copy H264 into a fragmented MP4 (playable even if killed)
+        #  2) MJPEG frames at DETECT_FPS to stdout for detection
+        self.ffmpeg = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-loglevel", "error",
+                "-fflags", "+genpts",
+                "-i", "pipe:0",
+                # Output 1 — the saved video
+                "-map", "0:v", "-c:v", "copy",
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4", self.video_path,
+                # Output 2 — detection frames
+                "-map", "0:v", "-vf", f"fps={DETECT_FPS}",
+                "-c:v", "mjpeg", "-q:v", "3", "-f", "image2pipe", "pipe:1",
+            ],
+            stdin=self.rpicam.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        # Let the parent close its handle so ffmpeg gets EOF if rpicam dies.
+        self.rpicam.stdout.close()
+        print("🎥 Recording started (rpicam-vid -> ffmpeg)")
 
-    picam2.start()
-    time.sleep(4)  # give AE/AWB time to fully converge
+    def read_frame(self):
+        """Return the next decoded BGR frame, or None if the stream ended."""
+        SOI = b"\xff\xd8"  # JPEG start of image
+        EOI = b"\xff\xd9"  # JPEG end of image
+        while True:
+            start = self._buf.find(SOI)
+            end = self._buf.find(EOI, start + 2) if start != -1 else -1
+            if start != -1 and end != -1:
+                jpg = self._buf[start:end + 2]
+                self._buf = self._buf[end + 2:]
+                return cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
 
-    filename = "capture.jpg"
+            chunk = self.ffmpeg.stdout.read(65536)
+            if not chunk:
+                return None
+            self._buf += chunk
 
-    # Capture as numpy array then write with OpenCV at quality 95.
-    # This avoids any intermediate re-encoding and gives full control.
-    frame = picam2.capture_array("main")
-    cv2.imwrite(filename, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-    picam2.stop()
-    picam2.close()
-
-    print(f"✅ Captured {frame.shape[1]}x{frame.shape[0]} → {filename}")
-    return filename
+    def stop(self):
+        """Stop recording cleanly so the MP4 finalizes."""
+        for proc in (self.rpicam, self.ffmpeg):
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        print(f"🛑 Recording stopped → {self.video_path}")
 
 # =========================
 # SHARPEN IMAGE
@@ -298,66 +361,113 @@ def run_ocr(plate_img):
     return text.strip()
 
 # =========================
-# PIPELINE
-# ✅ Key fix: Don't shrink full image before detection
+# PIPELINE — runs on the LIVE video stream
+#
+#   1) video starts recording
+#   2) on accident car detected -> grab a frame (video keeps recording)
+#   3) on license plate detected -> grab another frame, crop the
+#      plate region, OCR it, stop recording
+#   4) upload picture(s) + video to Supabase
 # =========================
-def run_pipeline(path):
-    full_img = cv2.imread(path)
+def run_pipeline():
+    recorder = VideoRecorder("video.mp4")
+    recorder.start()
 
-    # ✅ Use medium resize for accident detection (keeps enough detail)
-    accident_img = cv2.resize(full_img, (1280, 768))
+    accident_detected = False
+    accident_frame_path = None
+    plate_crop_path = None
+    plate_text = "unknown"
 
-    # 1) Accident detection
-    accident = accident_model(accident_img, verbose=False)
-    if accident[0].boxes is None or len(accident[0].boxes) == 0:
-        print("No accident detected ❌ — uploading anyway")
-        upload_to_supabase(path)
+    start_time = time.time()
+    try:
+        while True:
+            if time.time() - start_time > MAX_RECORD_SECONDS:
+                print(f"⏱️  No plate within {MAX_RECORD_SECONDS}s — stopping")
+                break
+
+            frame = recorder.read_frame()
+            if frame is None:
+                print("⚠️  Video stream ended")
+                break
+
+            # ---- Step 2: accident detection (until one is found) ----
+            if not accident_detected:
+                det = accident_model(
+                    cv2.resize(frame, (1280, 768)), verbose=False
+                )
+                boxes = det[0].boxes
+                if boxes is None or len(boxes) == 0:
+                    continue
+                conf = boxes.conf[0].item()
+                if conf < CONFIDENCE_THRESHOLD:
+                    continue
+
+                accident_detected = True
+                accident_frame_path = "accident_frame.jpg"
+                cv2.imwrite(accident_frame_path, frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                print(f"💥 Accident detected ({conf:.2f}) — frame saved, "
+                      f"video still recording")
+                continue
+
+            # ---- Step 3: plate detection (after an accident) ----
+            plate = plate_model(sharpen(frame), verbose=False)
+            pboxes = plate[0].boxes
+            if pboxes is None or len(pboxes) == 0:
+                continue
+            pconf = pboxes.conf[0].item()
+            if pconf < CONFIDENCE_THRESHOLD:
+                continue
+
+            print(f"🚗 Plate detected ({pconf:.2f}) — grabbing frame")
+
+            # Save the full plate frame
+            cv2.imwrite("plate_frame.jpg", frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+            # Crop the plate region from this frame
+            x1, y1, x2, y2 = map(int, pboxes.xyxy[0].cpu().numpy())
+            plate_crop = frame[y1:y2, x1:x2]
+
+            # Optionally refine to the inner region with region_model
+            try:
+                rdet = region_model(plate_crop, verbose=False)
+                rboxes = rdet[0].boxes
+                if rboxes is not None and len(rboxes) > 0:
+                    rx1, ry1, rx2, ry2 = map(
+                        int, rboxes.xyxy[0].cpu().numpy())
+                    region = plate_crop[ry1:ry2, rx1:rx2]
+                    if region.size > 0:
+                        plate_crop = region
+            except Exception as e:
+                print(f"region_model skipped: {e}")
+
+            plate_crop_path = "plate_crop.jpg"
+            cv2.imwrite(plate_crop_path, plate_crop)
+
+            plate_text = run_ocr(plate_crop)
+            print(f"🔎 Plate text: '{plate_text}'")
+            break
+    finally:
+        # Step 4 prerequisite: stop recording so the MP4 finalizes
+        recorder.stop()
+
+    if not accident_detected:
+        print("No accident detected — nothing uploaded")
         return
 
-    accident_conf = accident[0].boxes.conf[0].item()
-    print(f"Accident confidence: {accident_conf:.2f}")
-    if accident_conf < CONFIDENCE_THRESHOLD:
-        print("Accident confidence too low ❌ — uploading anyway")
-        upload_to_supabase(path)
-        return
-
-    print("Accident detected ✅")
-
-    # ✅ Use full resolution for plate detection
-    plate_img = sharpen(full_img)
-    plate = plate_model(plate_img, verbose=False)
-
-    if plate[0].boxes is None or len(plate[0].boxes) == 0:
-        print("No plate detected ❌")
-        upload_to_supabase(path)
-        return
-
-    plate_conf = plate[0].boxes.conf[0].item()
-    print(f"Plate confidence: {plate_conf:.2f}")
-    if plate_conf < CONFIDENCE_THRESHOLD:
-        print("Plate confidence too low ❌")
-        upload_to_supabase(path)
-        return
-
-    # ✅ Crop plate from full resolution image
-    box = plate[0].boxes.xyxy[0].cpu().numpy()
-    x1, y1, x2, y2 = map(int, box)
-    plate_crop = full_img[y1:y2, x1:x2]
-
-    # Save cropped plate
-    cv2.imwrite("plate_crop.jpg", plate_crop)
-
-    # 3) OCR
-    text = run_ocr(plate_crop)
-    print(f"Plate text: '{text}'")
-
-    # 4) Upload
-    upload_to_supabase(path, plate_text=text)
+    # ---- Step 4: upload picture(s) + video ----
+    upload_event(
+        video_path=recorder.video_path,
+        accident_path=accident_frame_path,
+        plate_path=plate_crop_path,
+        plate_text=plate_text,
+    )
 
 # =========================
 # MAIN
 # =========================
-img = capture_image()
-run_pipeline(img)
+if __name__ == "__main__":
+    run_pipeline()
 
 
