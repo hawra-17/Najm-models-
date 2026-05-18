@@ -149,6 +149,10 @@
 # img = capture_image()
 # run_pipeline(img)
 
+import faulthandler
+faulthandler.enable()  # on a crash (e.g. "Illegal instruction"), print
+                       # the Python traceback so we see which library died
+
 import cv2
 import time
 import requests
