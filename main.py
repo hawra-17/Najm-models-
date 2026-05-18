@@ -244,6 +244,10 @@ class VideoRecorder:
         self.rpicam = None
         self.ffmpeg = None
         self._buf = b""
+        # Errors from the subprocesses go here instead of being hidden,
+        # so we can see WHY no frames arrive.
+        self._rpicam_log = open("rpicam.log", "wb")
+        self._ffmpeg_log = open("ffmpeg.log", "wb")
 
     def start(self):
         if os.path.exists(self.video_path):
@@ -251,6 +255,9 @@ class VideoRecorder:
 
         # rpicam-vid: continuous (-t 0), H264 to stdout. --inline keeps
         # SPS/PPS headers in-stream so ffmpeg can start decoding immediately.
+        # start_new_session=True puts the children in their OWN process
+        # group, so Ctrl+C (SIGINT) does NOT get delivered to them — we
+        # control their shutdown explicitly in stop().
         self.rpicam = subprocess.Popen(
             [
                 "rpicam-vid",
@@ -264,17 +271,21 @@ class VideoRecorder:
                 "-o", "-",
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._rpicam_log,
+            start_new_session=True,
         )
 
         # ffmpeg: one input, two outputs.
         #  1) copy H264 into a fragmented MP4 (playable even if killed)
         #  2) MJPEG frames at DETECT_FPS to stdout for detection
+        # "-f h264" tells ffmpeg the pipe is a raw H264 stream so it does
+        # not stall probing an unknown non-seekable input.
         self.ffmpeg = subprocess.Popen(
             [
                 "ffmpeg",
-                "-loglevel", "error",
+                "-loglevel", "warning",
                 "-fflags", "+genpts",
+                "-f", "h264",
                 "-i", "pipe:0",
                 # Output 1 — the saved video
                 "-map", "0:v", "-c:v", "copy",
@@ -282,18 +293,28 @@ class VideoRecorder:
                 "-f", "mp4", self.video_path,
                 # Output 2 — detection frames
                 "-map", "0:v", "-vf", f"fps={DETECT_FPS}",
-                "-c:v", "mjpeg", "-q:v", "3", "-f", "image2pipe", "pipe:1",
+                "-c:v", "mjpeg", "-q:v", "3",
+                "-flush_packets", "1", "-f", "image2pipe", "pipe:1",
             ],
             stdin=self.rpicam.stdout,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._ffmpeg_log,
+            start_new_session=True,
         )
         # Let the parent close its handle so ffmpeg gets EOF if rpicam dies.
         self.rpicam.stdout.close()
-        print("🎥 Recording started (rpicam-vid -> ffmpeg)")
+        print("🎥 Recording started (rpicam-vid -> ffmpeg). "
+              "Logs: rpicam.log / ffmpeg.log")
 
-    def read_frame(self):
-        """Return the next decoded BGR frame, or None if the stream ended."""
+    def read_frame(self, timeout=15):
+        """
+        Return the next decoded BGR frame.
+
+        Returns None if the stream ended OR no data arrived within
+        `timeout` seconds (so the loop never blocks forever).
+        """
+        import select
+
         SOI = b"\xff\xd8"  # JPEG start of image
         EOI = b"\xff\xd9"  # JPEG end of image
         while True:
@@ -302,7 +323,19 @@ class VideoRecorder:
             if start != -1 and end != -1:
                 jpg = self._buf[start:end + 2]
                 self._buf = self._buf[end + 2:]
-                return cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                return cv2.imdecode(np.frombuffer(jpg, np.uint8),
+                                    cv2.IMREAD_COLOR)
+
+            # Wait up to `timeout`s for data; keeps Ctrl+C responsive
+            # and surfaces a stuck pipeline instead of hanging.
+            ready, _, _ = select.select([self.ffmpeg.stdout], [], [], timeout)
+            if not ready:
+                if self.rpicam.poll() is not None:
+                    print("❌ rpicam-vid exited — see rpicam.log")
+                if self.ffmpeg.poll() is not None:
+                    print("❌ ffmpeg exited — see ffmpeg.log")
+                print(f"⚠️  No video frames for {timeout}s — check the logs")
+                return None
 
             chunk = self.ffmpeg.stdout.read(65536)
             if not chunk:
@@ -311,13 +344,27 @@ class VideoRecorder:
 
     def stop(self):
         """Stop recording cleanly so the MP4 finalizes."""
-        for proc in (self.rpicam, self.ffmpeg):
+        import signal
+
+        for proc in (self.ffmpeg, self.rpicam):
             if proc and proc.poll() is None:
-                proc.terminate()
+                try:
+                    # Kill the whole child process group.
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    proc.terminate()
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        proc.kill()
+        for f in (self._rpicam_log, self._ffmpeg_log):
+            try:
+                f.close()
+            except Exception:
+                pass
         print(f"🛑 Recording stopped → {self.video_path}")
 
 # =========================
@@ -378,6 +425,7 @@ def run_pipeline():
     plate_crop_path = None
     plate_text = "unknown"
 
+    frame_count = 0
     start_time = time.time()
     try:
         while True:
@@ -387,8 +435,19 @@ def run_pipeline():
 
             frame = recorder.read_frame()
             if frame is None:
-                print("⚠️  Video stream ended")
+                print("⚠️  No more frames — stopping (check rpicam.log / "
+                      "ffmpeg.log if this was immediate)")
                 break
+
+            frame_count += 1
+            # Heartbeat: proves frames are flowing and detection is running.
+            if frame_count == 1:
+                print(f"✅ First frame received ({frame.shape[1]}x"
+                      f"{frame.shape[0]}) — detection is live")
+            elif frame_count % 10 == 0:
+                state = "looking for plate" if accident_detected \
+                    else "looking for accident"
+                print(f"… {frame_count} frames processed ({state})")
 
             # ---- Step 2: accident detection (until one is found) ----
             if not accident_detected:
@@ -448,6 +507,8 @@ def run_pipeline():
             plate_text = run_ocr(plate_crop)
             print(f"🔎 Plate text: '{plate_text}'")
             break
+    except KeyboardInterrupt:
+        print("\n⏹️  Ctrl+C — stopping recording and exiting")
     finally:
         # Step 4 prerequisite: stop recording so the MP4 finalizes
         recorder.stop()
