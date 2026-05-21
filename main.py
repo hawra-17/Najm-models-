@@ -415,10 +415,13 @@ def run_ocr(plate_img):
 # PIPELINE — runs on the LIVE video stream
 #
 #   1) video starts recording
-#   2) on accident car detected -> grab a frame (video keeps recording)
-#   3) on license plate detected -> grab another frame, crop the
-#      plate region, OCR it, stop recording
-#   4) upload picture(s) + video to Supabase
+#   2) run BOTH detectors on every frame:
+#        - on accident detected -> save accident frame (once)
+#        - on plate detected    -> save plate frame + crop, OCR, stop
+#   3) Plate capture is independent of accident detection: a plate can
+#      be uploaded even if no accident is ever seen.
+#   4) Stop recording on plate detected OR on timeout, then upload
+#      whatever was captured (video + any frames found).
 # =========================
 def run_pipeline():
     recorder = VideoRecorder("video.mp4")
@@ -434,7 +437,7 @@ def run_pipeline():
     try:
         while True:
             if time.time() - start_time > MAX_RECORD_SECONDS:
-                print(f"⏱️  No plate within {MAX_RECORD_SECONDS}s — stopping")
+                print(f"⏱️  Timeout ({MAX_RECORD_SECONDS}s) — stopping")
                 break
 
             frame = recorder.read_frame()
@@ -444,36 +447,33 @@ def run_pipeline():
                 break
 
             frame_count += 1
-            # Heartbeat: proves frames are flowing and detection is running.
             if frame_count == 1:
                 print(f"✅ First frame received ({frame.shape[1]}x"
                       f"{frame.shape[0]}) — detection is live")
             elif frame_count % 10 == 0:
-                state = "looking for plate" if accident_detected \
-                    else "looking for accident"
-                print(f"… {frame_count} frames processed ({state})")
+                got = []
+                if accident_detected: got.append("accident✓")
+                if plate_crop_path:   got.append("plate✓")
+                print(f"… {frame_count} frames processed "
+                      f"({', '.join(got) or 'still scanning'})")
 
-            # ---- Step 2: accident detection (until one is found) ----
+            # ---- Accident detection (always; saves once) ----
             if not accident_detected:
                 det = accident_model(
                     cv2.resize(frame, (1280, 768)), verbose=False
                 )
                 boxes = det[0].boxes
-                if boxes is None or len(boxes) == 0:
-                    continue
-                conf = boxes.conf[0].item()
-                if conf < CONFIDENCE_THRESHOLD:
-                    continue
+                if boxes is not None and len(boxes) > 0:
+                    conf = boxes.conf[0].item()
+                    if conf >= CONFIDENCE_THRESHOLD:
+                        accident_detected = True
+                        accident_frame_path = "accident_frame.jpg"
+                        cv2.imwrite(accident_frame_path, frame,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+                        print(f"💥 Accident detected ({conf:.2f}) — frame "
+                              f"saved, video still recording")
 
-                accident_detected = True
-                accident_frame_path = "accident_frame.jpg"
-                cv2.imwrite(accident_frame_path, frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, 95])
-                print(f"💥 Accident detected ({conf:.2f}) — frame saved, "
-                      f"video still recording")
-                continue
-
-            # ---- Step 3: plate detection (after an accident) ----
+            # ---- Plate detection (always; not gated on accident) ----
             plate = plate_model(sharpen(frame), verbose=False)
             pboxes = plate[0].boxes
             if pboxes is None or len(pboxes) == 0:
@@ -484,11 +484,9 @@ def run_pipeline():
 
             print(f"🚗 Plate detected ({pconf:.2f}) — grabbing frame")
 
-            # Save the full plate frame
             cv2.imwrite("plate_frame.jpg", frame,
                         [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-            # Crop the plate region from this frame
             x1, y1, x2, y2 = map(int, pboxes.xyxy[0].cpu().numpy())
             plate_crop = frame[y1:y2, x1:x2]
 
@@ -514,14 +512,13 @@ def run_pipeline():
     except KeyboardInterrupt:
         print("\n⏹️  Ctrl+C — stopping recording and exiting")
     finally:
-        # Step 4 prerequisite: stop recording so the MP4 finalizes
         recorder.stop()
 
-    if not accident_detected:
-        print("No accident detected — nothing uploaded")
+    # Upload if we captured anything at all (plate OR accident).
+    if not accident_detected and not plate_crop_path:
+        print("Nothing detected — no upload")
         return
 
-    # ---- Step 4: upload picture(s) + video ----
     upload_event(
         video_path=recorder.video_path,
         accident_path=accident_frame_path,
